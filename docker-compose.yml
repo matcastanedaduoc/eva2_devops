@@ -1,0 +1,184 @@
+# ================================================================
+# Docker Compose – Logística Andina (Monorepo, Three-Tier)
+# ================================================================
+#
+#  TIER 1 – PUBLIC     → frontend        (Nginx + React SPA)
+#  TIER 2 – PRIVATE    → ventas-service   (Spring Boot :8080)
+#                        despachos-service (Spring Boot :8081)
+#  TIER 3 – DATA       → mysql-db         (MySQL 8.0  :3306)
+#
+# USAGE
+#   Local build :  docker compose up -d --build
+#   From ECR    :  ECR_REGISTRY=<id>.dkr.ecr.us-east-1.amazonaws.com docker compose up -d
+#   Tear down   :  docker compose down        (keeps volumes)
+#   Full reset  :  docker compose down -v     (deletes data)
+# ================================================================
+
+services:
+
+  # ── TIER 1 · PUBLIC ─────────────────────────────────────────────
+  frontend:
+    build:
+      context: ./front_despacho
+      dockerfile: Dockerfile
+    image: ${ECR_REGISTRY:-logistica}/frontend:${IMAGE_TAG:-latest}
+    container_name: logistica-frontend
+    restart: unless-stopped
+    ports:
+      - "${FRONTEND_PORT:-80}:8080"
+    environment:
+      - VITE_VENTAS_API_URL=${VITE_VENTAS_API_URL:-http://ventas-service:8080}
+      - VITE_DESPACHOS_API_URL=${VITE_DESPACHOS_API_URL:-http://despachos-service:8081}
+    networks:
+      - frontend-net
+      - backend-net
+    depends_on:
+      ventas-service:
+        condition: service_healthy
+      despachos-service:
+        condition: service_healthy
+    volumes:
+      - frontend-cache:/var/cache/nginx
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8080/"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  # ── TIER 2 · PRIVATE ────────────────────────────────────────────
+  ventas-service:
+    build:
+      context: ./back-Ventas_SpringBoot/Springboot-API-REST
+      dockerfile: Dockerfile
+    image: ${ECR_REGISTRY:-logistica}/ventas:${IMAGE_TAG:-latest}
+    container_name: logistica-ventas
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    environment:
+      - DB_ENDPOINT=${DB_ENDPOINT:-mysql-db}
+      - DB_PORT=${DB_PORT:-3306}
+      - DB_NAME=${VENTAS_DB_NAME:-ventas_db}
+      - DB_USERNAME=${DB_USERNAME:-logistica_user}
+      - DB_PASSWORD=${DB_PASSWORD:-logistica_secret}
+    networks:
+      - backend-net
+      - data-net
+    depends_on:
+      mysql-db:
+        condition: service_healthy
+    volumes:
+      - ventas-logs:/app/logs
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8080/swagger-ui.html"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+
+  despachos-service:
+    build:
+      context: ./back-Despachos_SpringBoot/Springboot-API-REST-DESPACHO
+      dockerfile: Dockerfile
+    image: ${ECR_REGISTRY:-logistica}/despachos:${IMAGE_TAG:-latest}
+    container_name: logistica-despachos
+    restart: unless-stopped
+    ports:
+      - "8081:8081"
+    environment:
+      - DB_ENDPOINT=${DB_ENDPOINT:-mysql-db}
+      - DB_PORT=${DB_PORT:-3306}
+      - DB_NAME=${DESPACHOS_DB_NAME:-despachos_db}
+      - DB_USERNAME=${DB_USERNAME:-logistica_user}
+      - DB_PASSWORD=${DB_PASSWORD:-logistica_secret}
+    networks:
+      - backend-net
+      - data-net
+    depends_on:
+      mysql-db:
+        condition: service_healthy
+    volumes:
+      - despachos-logs:/app/logs
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8081/swagger-ui.html"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+
+  # ── TIER 3 · DATA ───────────────────────────────────────────────
+  mysql-db:
+    image: mysql:8.0
+    container_name: logistica-mysql
+    restart: unless-stopped
+    environment:
+      - MYSQL_ROOT_PASSWORD=${MYSQL_ROOT_PASSWORD:-rootsecret_change_me}
+      - MYSQL_USER=${DB_USERNAME:-logistica_user}
+      - MYSQL_PASSWORD=${DB_PASSWORD:-logistica_secret}
+    expose:
+      - "3306"
+    networks:
+      - data-net
+    volumes:
+      - mysql-data:/var/lib/mysql
+      - ./init-db:/docker-entrypoint-initdb.d:ro
+    command: >
+      --default-authentication-plugin=mysql_native_password
+      --character-set-server=utf8mb4
+      --collation-server=utf8mb4_unicode_ci
+      --max-connections=200
+      --innodb-buffer-pool-size=256M
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "root", "-p${MYSQL_ROOT_PASSWORD:-rootsecret_change_me}"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+# ──────────────────────────────────────────────────────────────────
+# NETWORKS – Three-tier isolation (mirrors AWS VPC subnets)
+#
+#  frontend-net : public facing, only the frontend lives here
+#  backend-net  : frontend → backend communication
+#  data-net     : INTERNAL — only backends reach MySQL
+# ──────────────────────────────────────────────────────────────────
+networks:
+  frontend-net:
+    driver: bridge
+    name: logistica-frontend-net
+
+  backend-net:
+    driver: bridge
+    name: logistica-backend-net
+
+  data-net:
+    driver: bridge
+    name: logistica-data-net
+    internal: true
+
+# ──────────────────────────────────────────────────────────────────
+# VOLUMES – Named volumes for persistent data
+#
+# Named volumes are used instead of bind mounts because:
+#  • Managed by Docker — no dependency on host directory paths
+#  • Portable across environments (local dev ↔ EC2)
+#  • Survive `docker compose down` (only removed with -v flag)
+#  • Better I/O performance for databases on Linux
+# ──────────────────────────────────────────────────────────────────
+volumes:
+  mysql-data:
+    driver: local
+    name: logistica-mysql-data
+
+  ventas-logs:
+    driver: local
+    name: logistica-ventas-logs
+
+  despachos-logs:
+    driver: local
+    name: logistica-despachos-logs
+
+  frontend-cache:
+    driver: local
+    name: logistica-frontend-cache
